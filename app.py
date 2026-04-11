@@ -327,5 +327,5 @@ AI SUMMARY
             st.dataframe(df.head(100), use_container_width=True)
 
 # ── Footer ────────────────────────────────────────────────────────────────────
-st.markdown("<br><br>")
+# st.markdown("<br><br>")
 st.markdown("<p style='text-align:center;color:#333;font-size:0.78rem;'>Dataset Summariser · Built with Streamlit + Claude AI</p>", unsafe_allow_html=True)

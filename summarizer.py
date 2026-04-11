@@ -1,65 +1,133 @@
-import os
 import json
-import google.generativeai as genai
-from dotenv import load_dotenv
-
-load_dotenv()
-
-
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import torch
+ 
+# ── Model Loading ─────────────────────────────────────────────────────────────
+MODEL_NAME = "google/flan-t5-base"
+ 
+_model = None
+_tokenizer = None
+ 
+ 
+def _load_model():
+    """Load model and tokenizer once, cache in memory for reuse."""
+    global _model, _tokenizer
+    if _model is None:
+        _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        _model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+        _model.eval()
+    return _model, _tokenizer
+ 
+ 
+def _build_prompt(analysis: dict) -> str:
+    """Build a structured plain-text prompt from dataset analysis metadata."""
+ 
+    numeric_info = "None"
+    if analysis["numeric_summary"]:
+        parts = []
+        for col, stats in list(analysis["numeric_summary"].items())[:4]:
+            parts.append(f"{col} (min={stats['min']}, max={stats['max']}, mean={stats['mean']})")
+        numeric_info = "; ".join(parts)
+ 
+    text_info = "None"
+    if analysis["text_insights"]:
+        parts = []
+        for col, vals in list(analysis["text_insights"].items())[:3]:
+            top = list(vals.keys())[:2]
+            parts.append(f"{col}: top values are {', '.join(str(v) for v in top)}")
+        text_info = "; ".join(parts)
+ 
+    prompt = f"""Analyze this dataset and write a professional summary report.
+ 
+Dataset facts:
+- Rows: {analysis['rows']}, Columns: {analysis['columns']}
+- Column names: {', '.join(analysis['column_names'])}
+- Data types: {json.dumps(analysis['dtype_counts'])}
+- Missing cells: {analysis['missing_cells']} ({analysis['missing_pct']}%)
+- Duplicate rows: {analysis['duplicate_rows']}
+- Numeric columns: {', '.join(analysis['numeric_cols']) if analysis['numeric_cols'] else 'None'}
+- Text columns: {', '.join(analysis['text_cols'][:8]) if analysis['text_cols'] else 'None'}
+- Columns with over 50% nulls: {', '.join(analysis['high_null_cols']) if analysis['high_null_cols'] else 'None'}
+- Potential ID columns: {', '.join(analysis['potential_id_cols']) if analysis['potential_id_cols'] else 'None'}
+- Numeric stats: {numeric_info}
+- Text column top values: {text_info}
+ 
+Write a clear summary covering: what the dataset is about, its size, data quality issues, types of data, notable patterns, and what it could be used for."""
+ 
+    return prompt
+ 
+ 
+def _post_process(raw_text: str, analysis: dict) -> str:
+    """Combine structured stats block with the AI generated text."""
+    dtype_lines = "\n".join([f"  • {k}: {v} column(s)" for k, v in analysis["dtype_counts"].items()])
+ 
+    null_warning = ""
+    if analysis["high_null_cols"]:
+        null_warning = f"\n⚠️ **High Null Columns (>50%):** {', '.join(analysis['high_null_cols'])}"
+ 
+    dup_warning = ""
+    if analysis["duplicate_rows"] > 0:
+        dup_warning = f"\n⚠️ **Duplicate Rows Detected:** {analysis['duplicate_rows']}"
+ 
+    report = f"""**📋 Dataset Overview**
+- **Shape:** {analysis['rows']:,} rows × {analysis['columns']} columns
+- **Missing Data:** {analysis['missing_cells']:,} cells ({analysis['missing_pct']}%)
+- **Duplicate Rows:** {analysis['duplicate_rows']}
+ 
+**📊 Column Types**
+{dtype_lines}{null_warning}{dup_warning}
+ 
+**🤖 AI Analysis**
+{raw_text.strip()}
+"""
+    return report
+ 
+ 
 def generate_summary(analysis: dict) -> str:
     """
-    Send dataset analysis to Google Gemini API and get back a human-readable summary report.
+    Main function called by app.py.
+    Loads flan-t5-base locally, runs inference, returns formatted report.
     """
-    api_key = os.environ.get("GEMINI_API_KEY")
-
-    if not api_key:
-        return "❌ **API Key Missing**: Please set your GEMINI_API_KEY in the `.env` file."
-
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-
-    # Build a structured prompt from analysis
-    prompt = f"""
-You are a data analyst assistant. I have analysed a dataset and will provide you its structural metadata.
-Please generate a clear, insightful, and concise summary report of this dataset in plain English.
-
-Your summary should cover:
-1. A brief overall description of what this dataset likely contains (inferred from column names and types)
-2. Size and shape (rows, columns)
-3. Data quality observations (missing data, duplicates)
-4. Types of data present (numeric, text, datetime, etc.)
-5. Notable columns or patterns (potential ID columns, high-null columns, key numeric ranges)
-6. A short recommendation on what this dataset could be used for
-
-Keep it professional but readable. Use bullet points where helpful. Write 150-250 words.
-
---- DATASET METADATA ---
-Rows: {analysis['rows']}
-Columns: {analysis['columns']}
-Column Names: {', '.join(analysis['column_names'])}
-Data Types Breakdown: {json.dumps(analysis['dtype_counts'])}
-Missing Cells: {analysis['missing_cells']} ({analysis['missing_pct']}%)
-Duplicate Rows: {analysis['duplicate_rows']}
-Numeric Columns: {', '.join(analysis['numeric_cols']) if analysis['numeric_cols'] else 'None'}
-Text/Categorical Columns: {', '.join(analysis['text_cols'][:10]) if analysis['text_cols'] else 'None'}
-Potential ID Columns: {', '.join(analysis['potential_id_cols']) if analysis['potential_id_cols'] else 'None'}
-High-Null Columns (>50%): {', '.join(analysis['high_null_cols']) if analysis['high_null_cols'] else 'None'}
-Numeric Stats (sample): {json.dumps(dict(list(analysis['numeric_summary'].items())[:5]), indent=2) if analysis['numeric_summary'] else 'N/A'}
-Top Values in Text Columns (sample): {json.dumps(dict(list(analysis['text_insights'].items())[:3]), indent=2) if analysis['text_insights'] else 'N/A'}
---- END METADATA ---
-
-Now write the summary report:
-"""
-
     try:
-        response = model.generate_content(prompt)
-        return response.text
-
+        model, tokenizer = _load_model()
+ 
+        prompt = _build_prompt(analysis)
+ 
+        # Tokenize with truncation to fit flan-t5's 512 token limit
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=500,
+            padding=False
+        )
+ 
+        # Generate with no_grad for efficiency
+        with torch.no_grad():
+            output_ids = model.generate(
+                inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                max_new_tokens=300,
+                num_beams=4,
+                early_stopping=True,
+                no_repeat_ngram_size=3,
+            )
+ 
+        raw_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        return _post_process(raw_text, analysis)
+ 
     except Exception as e:
-        error_msg = str(e)
-        if "API_KEY_INVALID" in error_msg or "API key not valid" in error_msg:
-            return "❌ **Invalid API Key**: Your Gemini API key is incorrect. Please check your `.env` file."
-        elif "quota" in error_msg.lower():
-            return "❌ **Quota Exceeded**: Free tier limit reached. Try again after some time."
-        else:
-            return f"❌ **AI Summary Error**: {error_msg}\n\nYou can still view the dataset statistics in the other tabs."
+        # Fallback: return structured stats without AI text
+        dtype_lines = "\n".join([f"  • {k}: {v} column(s)" for k, v in analysis["dtype_counts"].items()])
+        return f"""**📋 Dataset Overview**
+- **Shape:** {analysis['rows']:,} rows × {analysis['columns']} columns
+- **Missing Data:** {analysis['missing_cells']:,} cells ({analysis['missing_pct']}%)
+- **Duplicate Rows:** {analysis['duplicate_rows']}
+ 
+**📊 Column Types**
+{dtype_lines}
+ 
+**⚠️ AI Model Error**
+Could not generate AI summary: {str(e)}
+ 
+_You can still explore your dataset using the Column Analysis, Statistics, and Data Preview tabs._"""
